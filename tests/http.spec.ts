@@ -13,7 +13,7 @@ type Headers = Record<string, string | undefined>
 function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
   let handler: Handler = async () => {}
   const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
-  registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
+  registerHttp(ctx as never, { ready: Promise.resolve(), closing: () => false, ...runtime } as unknown as HttpHost)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
     let status = 0, text = ''
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
@@ -65,6 +65,12 @@ it('decodes path parameters and parses each route\'s query', async () => {
   // Invalid offsets default to 0, and limits above the route maximum are clamped.
   expect(await call('GET', 'decisions?kind=accept%2Creopen&limit=500&offset=x&window=24h')).toEqual({ status: 200, body: { items: [], next_offset: null } })
   expect(seen).toEqual(['feishu:oc_1:om/root', { filter: { kinds: ['accept', 'reopen'], since: expect.any(String) }, offset: 0, limit: 200 }])
+})
+
+it('refuses management work while the Runtime stops', async () => {
+  const call = serve({ closing: () => true })
+  expect(await call('GET', 'state')).toEqual({ status: 503, body: { error: 'Orchestrator is stopping' } })
+  expect(await call('POST', 'threads/github%3A1/unsubscribe')).toEqual({ status: 503, body: { error: 'Orchestrator is stopping' } })
 })
 
 it('answers only a same-origin request from the panel on the loopback address', async () => {

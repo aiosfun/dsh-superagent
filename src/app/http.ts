@@ -48,6 +48,8 @@ export interface HttpHost {
   readonly setupProblem?: SetupProblem | undefined
   readonly feishuProblem?: SetupProblem | undefined
   configured(): boolean
+  /** True once shutdown began, including after losing the state directory lock: routes refuse new work. */
+  closing(): boolean
   links(): LinkTarget
   ticketEnvironment(ticket: Ticket): Variable[]
   checkSetup(): void
@@ -237,6 +239,8 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
+        // A stopping Runtime keeps no state: refuse work here too until its routes are disposed.
+        if (runtime.closing()) { json(res, 503, { error: 'Orchestrator is stopping' }); return }
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)
