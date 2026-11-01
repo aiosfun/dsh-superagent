@@ -50,6 +50,15 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+/** Default time after which a state directory lock whose owner stopped refreshing it may be taken over, in milliseconds. */
+const LOCK_STALE_MS = 30_000
+/** How often `proper-lockfile` refreshes the lock's mtime: half the stale threshold, so two refreshes fit inside it. */
+const LOCK_REFRESH_MS = 15_000
+/** Options of a `Runtime`; tests shorten the state directory lock's stale threshold. */
+export interface RuntimeOptions {
+  /** Time after which a lock whose owner stopped refreshing it is stale, in milliseconds. Defaults to 30 seconds. */
+  lockStale?: number
+}
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -84,13 +93,25 @@ export class Runtime extends Service implements SourceHost {
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
+  constructor(ctx: Context, readonly machine: Machine, restart: () => void, options: RuntimeOptions = {}) {
     super(ctx, 'orchestrator')
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
-    const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
-    const release = lockSync(machine.stateDir, { stale: 30_000, onCompromised: compromised })
+    const stale = options.lockStale ?? LOCK_STALE_MS
+    // `proper-lockfile` refreshes the lock's mtime on an unref'd timer that `release()` clears, which keeps a live
+    // owner's lock from going stale; passing `update` keeps that refresh at half the stale threshold.
+    const compromised = (error: Error) => {
+      this.runtimeHealth.set({ state: 'error', detail: error.message })
+      // Another process owns the state directory now: stop this Runtime instead of only aborting its lifetime, or
+      // passes, Executor work and management routes would keep writing to a database the new owner is using. `stop()`
+      // is idempotent and sets `closingFlag` before its first await, so work arriving now is refused. A compromised
+      // lock remains the new owner's: shutdown's release fails with `ERELEASED`, which it already logs.
+      void this.stop().catch((cause: unknown) => {
+        this.ctx.logger.warn('dsh-superagent could not stop after losing its state directory lock: %s', String(cause))
+      })
+    }
+    const release = lockSync(machine.stateDir, { stale, update: Math.min(LOCK_REFRESH_MS, Math.floor(stale / 2)), onCompromised: compromised })
     this.releaseLock = async () => { release() }
     let opened: Store | undefined
     try {
@@ -195,7 +216,8 @@ export class Runtime extends Service implements SourceHost {
   idle(): Promise<void> { return this.passes.idle() }
   pump(): Promise<void> { return this.passes.pump() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
-  private closing(): boolean { return this.closingFlag }
+  /** True once shutdown began; passes, Executor work and management routes refuse new work from then on. */
+  closing(): boolean { return this.closingFlag }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
   private async initialize(): Promise<void> {
@@ -222,7 +244,7 @@ export class Runtime extends Service implements SourceHost {
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
-      configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
+      configured: () => setup.configured(), closing: () => runtime.closing(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
       checkSetup: () => { setup.check() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
   }
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
